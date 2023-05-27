@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+
+set -e
+
+[ -n "$DEBUG" ] && set -x
+
+VERSION='1.0.0'
+CMD=${0}
+NAME=$(basename "${CMD}")
+CMD_DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+
+cd "$CMD_DIR"
+
+COMMAND=$1
+
+BOLD_RED='\033[1;31m'
+NO_COLOR='\033[0m'
+
+function realpath() {
+    OURPWD=$PWD
+    cd "$(dirname "$1")"
+    LINK=$(readlink "$(basename "$1")")
+    while [ "$LINK" ]; do
+        cd "$(dirname "$LINK")"
+        LINK=$(readlink "$(basename "$1")")
+    done
+    REALPATH="$PWD/$(basename "$1")"
+    cd "$OURPWD"
+    echo "$REALPATH"
+}
+
+this_script_path=$(realpath $0)
+this_script_directory_path=$(dirname $this_script_path)
+
+export AWS_PROFILE=${AWS_PROFILE:-default}
+export AWS_REGION=${AWS_REGION:-us-west-1}
+export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-$AWS_REGION}
+
+VOOM_LIKE_VERSION=$(build/voom-like-version.sh .)
+export EVENTS_DISPLAY_IMAGE_VERSION=${EVENTS_DISPLAY_IMAGE_VERSION:-$VOOM_LIKE_VERSION}
+EVENTS_DISPLAY_IMAGE_BASE=${EVENTS_DISPLAY_IMAGE_BASE:-device-events-display}
+EVENTS_DISPLAY_IMAGE_NAME=${EVENTS_DISPLAY_IMAGE_NAME:-${EVENTS_DISPLAY_IMAGE_BASE}:$EVENTS_DISPLAY_IMAGE_VERSION}
+EVENTS_DISPLAY_CONTAINER_PREFIX=${EVENTS_DISPLAY_CONTAINER_PREFIX:-$USER}
+EVENTS_DISPLAY_CONTAINER_NAME=${EVENTS_DISPLAY_CONTAINER_PREFIX}-${EVENTS_DISPLAY_IMAGE_BASE}
+EVENTS_DISPLAY_CONTAINER_LOG_SIZE=${EVENTS_DISPLAY_CONTAINER_LOG_SIZE:-10m}
+EVENTS_DISPLAY_CONTAINER_REPOSITORY=536359019322.dkr.ecr.us-west-1.amazonaws.com
+EVENTS_DISPLAY_FULLY_QUALIFIED_IMAGE_NAME=${EVENTS_DISPLAY_CONTAINER_REPOSITORY}/${EVENTS_DISPLAY_IMAGE_NAME}
+
+export EVENTS_DISPLAY_SERVICE_PORT=${EVENTS_DISPLAY_SERVICE_PORT:-9092}
+export EVENTS_DISPLAY_METRICS_PORT=${EVENTS_DISPLAY_METRICS_PORT:-9090}
+EVENTS_DISPLAY_SCHEME=${EVENTS_DISPLAY_SCHEME:-http}
+EVENTS_DISPLAY_ROOT_DIRECTORY_PATH=/app
+EVENTS_DISPLAY_CONFIG_DIRECTORY_PATH=$EVENTS_DISPLAY_ROOT_DIRECTORY_PATH/configs
+export EVENTS_DISPLAY_LOG_LEVEL=${EVENTS_DISPLAY_LOG_LEVEL:-DEBUG}
+
+PYTHON_VERSION=3.11
+PYTHON_EXECUTABLE_NAME=${PYTHON_EXECUTABLE_NAME:-python${PYTHON_VERSION}}
+PIP_EXECUTABLE_NAME=${PIP_EXECUTABLE_NAME:-pip${PYTHON_VERSION}}
+
+VIRTUAL_ENVIRONMENT_DIRECTORY_NAME=${VIRTUAL_ENVIRONMENT_DIRECTORY_NAME:-.virtualenv}
+
+function print_help() {
+    cat <<EOF
+Usage: ${0} cmd [args] <optionals>
+  help                => show this help message.
+  build               => build the application container.
+  check               => run linters and typecheckers.
+  dev                 => run uvicorn in development (reload) mode.
+  init                => initialize a development enviroment from scratch.
+  style               => run formatters to enforce code style.
+  test                => run tests. Can specify path to a tests file to run only those tests.
+  up [arg1 arg2 ...]  => run an application container on your local host.
+EOF
+}
+
+function die() {
+    >&2 echo -e "${BOLD_RED}error:${NO_COLOR} $@"
+    exit 1
+}
+
+function join_by {
+    local IFS="$1"
+    shift
+    printf "$*"
+}
+
+# Turn on extended globbing for the "contains" function to work properly.
+shopt -s extglob
+
+function contains {
+    local element="$1"
+    shift
+    local array=("$@")
+
+    if [[ "$element" == @($(join_by '|' "${array[@]//|/\\|}")) ]]; then
+        echo "yes"
+    else
+        echo "no"
+    fi
+}
+
+# Convenience function to set the named variable.  Optionally, you can pass
+# the *name* of a validation array.  Finally, the user will have to
+# validate in an are-you-sure fashion whether the value is correct or not.
+function get-possibly-validated-value-from-user() {
+    local var_name=$1
+
+    local finished=0
+    local value
+
+    while [ $finished -eq 0 ]; do
+        if [ "$#" -gt 1 ]; then
+            local name=$2[@]
+            local validation_array=("${!name}")
+            local valid_value_string=$(join_by ", " ${validation_array[@]})
+
+            if [ ${#validation_array[@]} -gt 1 ]; then
+
+                read -p "Value of \"$var_name\"? ($valid_value_string) " value
+
+                if [ $(contains "$value" "${validation_array[@]}") != "yes" ]; then
+                    printf "The \"$var_name\" value of \"$value\" is not valid.  Valid values: $valid_value_string\n" >&2
+                    continue
+                fi
+            else
+                value=${validation_array[0]}
+            fi
+        else
+            read -p "Value of \"$var_name\"? " value
+        fi
+
+        if [ "$#" -eq 1 ] || [ ${#validation_array[@]} -gt 1 ]; then
+            read -p "The value of \"$var_name\" is \"$value\". Correct? [YyNn] " yn
+            if [[ $yn =~ ^[yY]$ ]]; then
+                finished=1
+            fi
+        else
+            # If the validation array was passed and it has only one element, we're done.
+            finished=1
+        fi
+    done
+
+    echo $value
+}
+
+function create_virtualenv {
+    if [ ! -d "$VIRTUAL_ENVIRONMENT_DIRECTORY_NAME" ]; then
+        mkdir -p $VIRTUAL_ENVIRONMENT_DIRECTORY_NAME
+	$PYTHON_EXECUTABLE_NAME -m venv "$VIRTUAL_ENVIRONMENT_DIRECTORY_NAME"
+    fi
+
+    source $VIRTUAL_ENVIRONMENT_DIRECTORY_NAME/bin/activate
+    python -m pip install --upgrade pip
+
+    if [ -f build/requirements.txt ]; then
+        $PIP_EXECUTABLE_NAME install -r build/requirements.txt
+    fi
+
+    if [ -f test/unit/requirements.txt ]; then
+	$PIP_EXECUTABLE_NAME install -r test/unit/requirements.txt
+    fi
+
+    if [ -f linters/requirements.txt ]; then
+        $PIP_EXECUTABLE_NAME install -r linters/requirements.txt
+    fi
+}
+
+function style {
+    black ./app
+    isort ./app
+}
+
+function image-repository-login {
+    aws ecr get-login-password --profile ${AWS_PROFILE} \
+        --region ${AWS_REGION} \
+        | docker login --username AWS --password-stdin ${EVENTS_DISPLAY_CONTAINER_REPOSITORY}
+}
+
+function app-test {
+    local test_type=$1; shift || true
+    if [[ ( ! -z "${COMMAND}" && "${COMMAND}" != "" ) ]]; then
+        test_type=$COMMAND
+    fi
+
+    local valid_test_types=(unit)
+
+    if [[ ( -z "${test_type}" || "${test_type}" = "" ) ]]; then
+        local test_type=$(get_possibly_validated_value_from_user "test_type" valid_test_types)
+    else
+        if [ $(contains "$test_type" "${valid_test_types[@]}") != "yes" ]; then
+            local valid_value_string=$(join_by ", " ${valid_test_types[@]})
+            die "The \"test_type\" value of \"$test_type\" is not valid.  Valid values: $valid_value_string\n" >&2
+        fi
+    fi
+
+    export EVENTS_DISPLAY_ROOT_DIRECTORY_PATH=$this_script_directory_path
+
+    if [ "$test_type" = "unit" ]; then
+        pytest --capture=tee-sys $this_script_directory_path/test/unit
+    else
+        local valid_value_string=$(join_by ", " ${valid_test_types[@]})
+        die "\"$test_type\" tests are not valid.  Valid test types:  $valid_value_string"
+    fi
+}
+
+function build {
+    # Get the JWT public key.
+    JWT_PUBLIC_KEY=$(aws secretsmanager get-secret-value --secret-id ${EVENTS_DISPLAY_IMAGE_BASE}/jwt-public-key | jq -r .SecretString)
+    
+    DOCKER_BUILDKIT=1 docker build \
+        --rm \
+        --progress plain \
+        --build-arg "EVENTS_DISPLAY_ROOT_DIRECTORY=${EVENTS_DISPLAY_ROOT_DIRECTORY}" \
+        --build-arg "PYTEST_ARGS=${PYTEST_ARGS:--vv ${EVENTS_DISPLAY_ROOT_DIRECTORY}/test/unit/}" \
+        --build-arg "EVENTS_DISPLAY_IMAGE_VERSION=${EVENTS_DISPLAY_IMAGE_VERSION}" \
+	--build-arg "JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY}" \
+	--build-arg "PYTHON_VERSION=${PYTHON_VERSION}" \
+        --tag ${EVENTS_DISPLAY_IMAGE_NAME} \
+        --file build/Dockerfile \
+        . 
+
+        echo "Built image \"$EVENTS_DISPLAY_IMAGE_NAME\"."
+}
+
+function down {
+    echo "Removing the container \"$EVENTS_DISPLAY_CONTAINER_NAME\" if it exists..."
+    docker rm -f ${EVENTS_DISPLAY_CONTAINER_NAME} || true
+}
+
+function up {
+    down
+
+    echo "Attempting to run the image ${EVENTS_DISPLAY_IMAGE_NAME} locally as the container named \"${EVENTS_DISPLAY_CONTAINER_NAME}\"..."
+
+    export JWT_PUBLIC_KEY=$(aws secretsmanager get-secret-value --secret-id ${EVENTS_DISPLAY_IMAGE_BASE}/jwt-public-key | jq -r .SecretString)
+    docker run \
+        --restart unless-stopped \
+        --detach \
+	--privileged \
+        --name ${EVENTS_DISPLAY_CONTAINER_NAME} \
+        --env "AWS_REGION=${AWS_REGION}" \
+        --env "EVENTS_DISPLAY_LOG_LEVEL=${EVENTS_DISPLAY_LOG_LEVEL}" \
+        --env "EVENTS_DISPLAY_SERVICE_PORT=${EVENTS_DISPLAY_SERVICE_PORT}" \
+        --env "EVENTS_DISPLAY_METRICS_PORT=${EVENTS_DISPLAY_METRICS_PORT}" \
+	--env "EVENTS_DISPLAY_IMAGE_VERSION=${EVENTS_DISPLAY_IMAGE_VERSION}" \
+        --env "DEBUG=${DEBUG}" \
+        --publish ${EVENTS_DISPLAY_SERVICE_PORT}:${EVENTS_DISPLAY_SERVICE_PORT} \
+        --publish ${EVENTS_DISPLAY_METRICS_PORT}:${EVENTS_DISPLAY_METRICS_PORT} \
+        ${EVENTS_DISPLAY_IMAGE_NAME}
+}
+
+function dev {
+    create_virtualenv
+    # Get the JWT public key.
+    export JWT_PUBLIC_KEY=$(aws secretsmanager get-secret-value --secret-id ${EVENTS_DISPLAY_IMAGE_BASE}/jwt-public-key | jq -r .SecretString)
+    chmod u+x ./application_startup.sh
+    down
+    ./application_startup.sh
+}
+
+function push-image  {
+    image-repository-login
+
+    echo "Attempting to tag the existing image \"$EVENTS_DISPLAY_IMAGE_NAME\" as \"$EVENTS_DISPLAY_FULLY_QUALIFIED_IMAGE_NAME\"."
+    docker tag $EVENTS_DISPLAY_IMAGE_NAME $EVENTS_DISPLAY_FULLY_QUALIFIED_IMAGE_NAME
+
+    echo "** now pushing $EVENTS_DISPLAY_FULLY_QUALIFIED_IMAGE_NAME"
+    docker push $EVENTS_DISPLAY_FULLY_QUALIFIED_IMAGE_NAME
+}
+
+function check () {
+    create_virtualenv
+
+    echo -e "Now running ${BOLD_RED}pyre${NO_COLOR} type checking."
+    pyre --source-directory app check || true
+
+    echo -e "Now running ${BOLD_RED}flake8${NO_COLOR} linting."
+    flake8 app || true
+
+    echo -e "Now running ${BOLD_RED}pydocstyle${NO_COLOR} checks."
+    pydocstyle app || true
+
+    echo -e "Now running ${BOLD_RED}vulture${NO_COLOR} checks for unused code."
+    vulture app
+}
+
+
+case ${COMMAND%%/} in
+    build) build ;;
+    check) check ;;
+    dev) dev ;;
+    down) down ;;
+    init) create_virtualenv ;;
+    push) push-image ;;
+    style) style ;;
+    test) app-test "$@" ;;
+    up) up "$@" ;;
+    *) print_help ;;
+esac
+

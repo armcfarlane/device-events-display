@@ -1,0 +1,7 @@
+aioboto3==11.2.0
+asyncio==3.4.3
+fastapi==0.95.2
+netaddr==0.8.0
+prometheus-fastapi-instrumentator==6.0.0
+PyJWT[crypto]==2.6.0
+uvicorn==0.21.1
